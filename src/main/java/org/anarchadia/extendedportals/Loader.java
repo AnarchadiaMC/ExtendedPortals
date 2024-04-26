@@ -5,7 +5,10 @@ import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.data.Directional;
 import org.bukkit.block.data.type.EndPortalFrame;
+import org.bukkit.entity.Boat;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.Vehicle;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -15,6 +18,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -217,6 +221,7 @@ public final class Loader extends JavaPlugin implements Listener {
     /**
      * Responds to the player movement event, checks if the player has moved into position
      * to be teleported through a portal, and performs the teleportation if conditions are met.
+     * Also allows for Players to teleport alongside non-player passengers in boats.
      *
      * @param event The player movement event.
      */
@@ -227,9 +232,7 @@ public final class Loader extends JavaPlugin implements Listener {
         int chunkX = to.getBlockX() >> 4;
         int chunkZ = to.getBlockZ() >> 4;
 
-        if (!portalChunks.contains(Math.abs(chunkX)) || !portalChunks.contains(Math.abs(chunkZ))) {
-            return;
-        }
+        if (!(portalChunks.contains(Math.abs(chunkX))) || !(portalChunks.contains(Math.abs(chunkZ)))) return;
 
         Block block = to.getWorld().getBlockAt(to.getBlockX(), to.getBlockY(), to.getBlockZ());
 
@@ -240,6 +243,16 @@ public final class Loader extends JavaPlugin implements Listener {
             if (!world.getName().equalsIgnoreCase("world")) return;
 
             Location endGatewayLocation = new Location(Bukkit.getWorld("world_the_end"), block.getX(), block.getY(), block.getZ());
+
+            if(player.isInsideVehicle() && player.getVehicle() instanceof Boat) {
+                Vehicle riding = (Vehicle) player.getVehicle();
+                List<Entity> passengers = riding.getPassengers();
+                passengers.forEach(entity -> {
+                    if(!(entity instanceof Player)) entity.teleport(endGatewayLocation);
+                });
+                riding.remove();
+            }
+
             player.teleport(endGatewayLocation);
         }
     }
