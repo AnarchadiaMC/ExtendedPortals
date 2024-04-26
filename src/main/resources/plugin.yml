@@ -1,0 +1,4 @@
+name: ExtendedPortals
+version: '${project.version}'
+main: org.anarchadia.extendedportals.Loader
+api-version: '1.20'
