@@ -5,21 +5,16 @@ import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.data.Directional;
 import org.bukkit.block.data.type.EndPortalFrame;
-import org.bukkit.entity.Boat;
 import org.bukkit.entity.Entity;
-import org.bukkit.entity.Player;
-import org.bukkit.entity.Vehicle;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.util.Vector;
 
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The main class for handling the creation of custom portals
@@ -27,6 +22,7 @@ import java.util.Set;
  */
 public final class Loader extends JavaPlugin implements Listener {
 
+    private final Map<UUID, Location> entityLocations = new ConcurrentHashMap<>();
     private final Set<Integer> portalChunks = new HashSet<>(Arrays.asList(
             156,     // Coordinates: 2500
             312,     // Coordinates: 5000
@@ -55,7 +51,31 @@ public final class Loader extends JavaPlugin implements Listener {
      */
     @Override
     public void onEnable() {
-        getServer().getPluginManager().registerEvents(this, this);
+        getServer().getPluginManager().registerEvents(this, this);  // Register event listeners
+
+        // Schedule the repeating task to check entity locations and handle portal teleportation
+        getServer().getScheduler().scheduleSyncRepeatingTask(this, () -> {
+            Set<UUID> currentEntities = new HashSet<>();  // Set to track current entities
+            // Iterate through all worlds and their entities
+            Bukkit.getWorlds().forEach(world -> world.getEntities().forEach(entity -> {
+                if (!(entity.getPassengers().isEmpty()) || entity.isInsideVehicle()) return;
+
+                UUID entityId = entity.getUniqueId();
+                Location currentLocation = entity.getLocation();
+
+                currentEntities.add(entityId);
+
+                if (entityLocations.containsKey(entityId)) {
+                    Location prevLocation = entityLocations.get(entityId);
+                    if (prevLocation.equals(currentLocation)) return;
+
+                    handleGateway(entity);  // Teleport entity to the gateway
+                }
+                entityLocations.put(entityId, currentLocation);
+            }));
+            // Remove entities that are no longer present
+            entityLocations.keySet().removeIf(id -> !currentEntities.contains(id));
+        }, 0L, 1L); // 0 tick delay, 1 tick period (1 tick = 50ms)
     }
 
     /**
@@ -165,11 +185,11 @@ public final class Loader extends JavaPlugin implements Listener {
     /**
      * Orientates the portal frame based on its position relative to the portal structure.
      *
-     * @param block   The block to orient.
-     * @param x       The x coordinate of the block to orient.
-     * @param startX  The starting x coordinate of the portal.
-     * @param z       The z coordinate of the block to orient.
-     * @param startZ  The starting z coordinate of the portal.
+     * @param block  The block to orient.
+     * @param x      The x coordinate of the block to orient.
+     * @param startX The starting x coordinate of the portal.
+     * @param z      The z coordinate of the block to orient.
+     * @param startZ The starting z coordinate of the portal.
      */
     private void orientPortalFrame(Block block, int x, int startX, int z, int startZ) {
         if (block.getType() != Material.END_PORTAL_FRAME) return;
@@ -219,41 +239,65 @@ public final class Loader extends JavaPlugin implements Listener {
     }
 
     /**
-     * Responds to the player movement event, checks if the player has moved into position
-     * to be teleported through a portal, and performs the teleportation if conditions are met.
-     * Also allows for Players to teleport alongside non-player passengers in boats.
+     * Teleports an entity to the corresponding location in the End world
+     * if the entity is within a custom end gateway in a designated portal chunk.
+     * Generates a 5x5 obsidian platform under the entity and naturally breaks blocks 3 blocks above the platform.
+     * Retains the entity's velocity with a limit of 200 m/s.
      *
-     * @param event The player movement event.
+     * @param entity The entity to potentially teleport.
      */
-    @EventHandler
-    public void onPlayerMove(PlayerMoveEvent event) {
-        Location to = event.getTo();
+    private void handleGateway(Entity entity) {
+        Location entityLocation = entity.getLocation();
+        int chunkX = entityLocation.getBlockX() >> 4;
+        int chunkZ = entityLocation.getBlockZ() >> 4;
 
-        int chunkX = to.getBlockX() >> 4;
-        int chunkZ = to.getBlockZ() >> 4;
+        // Check if the entity is in a relevant chunk
+        if (!portalChunks.contains(Math.abs(chunkX)) || !portalChunks.contains(Math.abs(chunkZ))) {
+            return;
+        }
 
-        if (!(portalChunks.contains(Math.abs(chunkX))) || !(portalChunks.contains(Math.abs(chunkZ)))) return;
-
-        Block block = to.getWorld().getBlockAt(to.getBlockX(), to.getBlockY(), to.getBlockZ());
-
+        Block block = entityLocation.getBlock();
         if (block.getType() == Material.END_GATEWAY) {
-            Player player = event.getPlayer();
-            World world = player.getWorld();
+            Location endGatewayLocation = new Location(
+                    Bukkit.getWorld("world_the_end"),
+                    block.getX(),
+                    block.getY(),
+                    block.getZ()
+            );
 
-            if (!world.getName().equalsIgnoreCase("world")) return;
-
-            Location endGatewayLocation = new Location(Bukkit.getWorld("world_the_end"), block.getX(), block.getY(), block.getZ());
-
-            if(player.isInsideVehicle() && player.getVehicle() instanceof Boat) {
-                Vehicle riding = (Vehicle) player.getVehicle();
-                List<Entity> passengers = riding.getPassengers();
-                passengers.forEach(entity -> {
-                    if(!(entity instanceof Player)) entity.teleport(endGatewayLocation);
-                });
-                riding.remove();
+            // Generate 5x5 obsidian platform centered on the entity's location
+            for (int x = -2; x <= 2; x++) {
+                for (int z = -2; z <= 2; z++) {
+                    Location platformBlockLocation = endGatewayLocation.clone().add(x, -1, z);
+                    platformBlockLocation.getBlock().setType(Material.OBSIDIAN);
+                }
             }
 
-            player.teleport(endGatewayLocation);
+            // Naturally break blocks 3 blocks above the obsidian platform
+            for (int x = -2; x <= 2; x++) {
+                for (int z = -2; z <= 2; z++) {
+                    for (int y = 0; y <= 3; y++) {
+                        Location clearBlockLocation = endGatewayLocation.clone().add(x, y, z);
+                        Block blockToClear = clearBlockLocation.getBlock();
+                        if (blockToClear.getType() != Material.AIR) {
+                            blockToClear.breakNaturally();
+                        }
+                    }
+                }
+            }
+
+            // Get and cap the entity's velocity
+            Vector velocity = entity.getVelocity();
+            double maxVelocity = 200.0; // Max velocity in m/s
+            if (velocity.length() > maxVelocity) {
+                velocity = velocity.normalize().multiply(maxVelocity);
+            }
+
+            // Teleport the entity to the specified location
+            entity.teleport(endGatewayLocation);
+
+            // Set the entity's velocity to the capped velocity
+            entity.setVelocity(velocity);
         }
     }
 }
