@@ -23,6 +23,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class Loader extends JavaPlugin implements Listener {
 
     private final Map<UUID, Location> entityLocations = new ConcurrentHashMap<>();
+    private final Map<Long, Long> chunkProcessingTimes = new ConcurrentHashMap<>();
+    private static final long CHUNK_COOLDOWN_MS = 30000; // 30 seconds cooldown
     private final Set<Integer> portalChunks = new HashSet<>(Arrays.asList(
             156,     // Coordinates: 2500
             312,     // Coordinates: 5000
@@ -97,6 +99,17 @@ public final class Loader extends JavaPlugin implements Listener {
         Chunk chunk = event.getChunk();
         if (!worldName.equalsIgnoreCase("world")) return;
 
+        long chunkKey = ((long) chunk.getX() << 32) | (chunk.getZ() & 0xFFFFFFFFL);
+        long currentTime = System.currentTimeMillis();
+        
+        // Check if the chunk was processed recently
+        if (chunkProcessingTimes.containsKey(chunkKey)) {
+            long lastProcessed = chunkProcessingTimes.get(chunkKey);
+            if (currentTime - lastProcessed < CHUNK_COOLDOWN_MS) {
+                return; // Skip if the chunk was processed too recently
+            }
+        }
+
         if (portalChunks.contains(Math.abs(chunk.getX())) && portalChunks.contains(Math.abs(chunk.getZ()))) {
             int startX = (chunk.getX() << 4);
             int startZ = (chunk.getZ() << 4);
@@ -104,6 +117,7 @@ public final class Loader extends JavaPlugin implements Listener {
             int groundY = chunk.getWorld().getHighestBlockYAt(startX + 8, startZ + 8);
 
             spawnPortal(chunk, startX + 7, groundY, startZ + 7);
+            chunkProcessingTimes.put(chunkKey, currentTime);
         }
     }
 
