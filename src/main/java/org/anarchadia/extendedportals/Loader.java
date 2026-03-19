@@ -5,12 +5,9 @@ import org.bukkit.Chunk;
 import org.bukkit.HeightMap;
 import org.bukkit.Location;
 import org.bukkit.Material;
-import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
-import org.bukkit.block.BlockState;
-import org.bukkit.block.EndGateway;
 import org.bukkit.block.data.Directional;
 import org.bukkit.block.data.type.EndPortalFrame;
 import org.bukkit.entity.Entity;
@@ -20,7 +17,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
-import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
 
@@ -51,7 +47,6 @@ public final class Loader extends JavaPlugin implements Listener {
     private static final int END_CLEARANCE_HEIGHT = 4;
     private static final double MAX_TELEPORT_VELOCITY = 200.0D;
     private static final long TELEPORT_COOLDOWN_MS = 1500L;
-    private static final byte GATEWAY_MARKER_VALUE = 1;
 
     private final Set<Integer> portalChunks = Collections.unmodifiableSet(new HashSet<Integer>(Arrays.asList(
             156,     // Coordinates: 2500
@@ -78,14 +73,11 @@ public final class Loader extends JavaPlugin implements Listener {
     private final Map<Long, Location> loadedPortalGateways = new HashMap<Long, Location>();
     private final Map<UUID, Long> teleportCooldowns = new HashMap<UUID, Long>();
 
-    private NamespacedKey gatewayMarkerKey;
     private long nextCooldownCleanupAt;
     private boolean warnedAboutMissingEndWorld;
 
     @Override
     public void onEnable() {
-        this.gatewayMarkerKey = new NamespacedKey(this, "managed_gateway");
-
         getServer().getPluginManager().registerEvents(this, this);
         trackLoadedPortalChunks();
         getServer().getScheduler().runTaskTimer(this, new Runnable() {
@@ -328,29 +320,6 @@ public final class Loader extends JavaPlugin implements Listener {
 
         Block gatewayBlock = world.getBlockAt(centerX, centerY, centerZ);
         setBlock(gatewayBlock, Material.END_GATEWAY);
-        configureGatewayState(gatewayBlock);
-    }
-
-    private void configureGatewayState(Block gatewayBlock) {
-        BlockState state = gatewayBlock.getState();
-        if (!(state instanceof EndGateway)) {
-            return;
-        }
-
-        EndGateway gateway = (EndGateway) state;
-        World endWorld = Bukkit.getWorld(END_WORLD_NAME);
-        if (endWorld != null) {
-            gateway.setExitLocation(new Location(
-                    endWorld,
-                    gatewayBlock.getX() + 0.5D,
-                    gatewayBlock.getY(),
-                    gatewayBlock.getZ() + 0.5D
-            ));
-            gateway.setExactTeleport(true);
-        }
-
-        gateway.getPersistentDataContainer().set(gatewayMarkerKey, PersistentDataType.BYTE, Byte.valueOf(GATEWAY_MARKER_VALUE));
-        gateway.update(true, false);
     }
 
     private void clearPortalStructure(World world, int startX, int baseY, int startZ) {
@@ -425,13 +394,6 @@ public final class Loader extends JavaPlugin implements Listener {
         if (block.getX() != expectedCenterX || block.getZ() != expectedCenterZ) {
             return false;
         }
-
-        BlockState state = block.getState();
-        if (state instanceof EndGateway) {
-            Byte marker = ((EndGateway) state).getPersistentDataContainer().get(gatewayMarkerKey, PersistentDataType.BYTE);
-            return marker == null || marker.byteValue() == GATEWAY_MARKER_VALUE;
-        }
-
         return true;
     }
 
