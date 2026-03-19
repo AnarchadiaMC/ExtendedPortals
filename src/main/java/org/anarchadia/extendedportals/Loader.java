@@ -1,31 +1,63 @@
 package org.anarchadia.extendedportals;
 
-import org.bukkit.*;
+import com.destroystokyo.paper.event.entity.EntityTeleportEndGatewayEvent;
+import com.destroystokyo.paper.event.player.PlayerTeleportEndGatewayEvent;
+import io.papermc.paper.entity.TeleportFlag;
+import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
+import org.bukkit.HeightMap;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
+import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
+import org.bukkit.block.BlockState;
+import org.bukkit.block.EndGateway;
 import org.bukkit.block.data.Directional;
 import org.bukkit.block.data.type.EndPortalFrame;
 import org.bukkit.entity.Entity;
+import org.bukkit.event.Cancellable;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
 
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 
 /**
- * The main class for handling the creation of custom portals
- * in the Minecraft world.
+ * Generates and maintains the fixed overworld portal network.
  */
 public final class Loader extends JavaPlugin implements Listener {
 
-    private final Map<UUID, Location> entityLocations = new ConcurrentHashMap<>();
-    private final Map<Long, Long> chunkProcessingTimes = new ConcurrentHashMap<>();
-    private static final long CHUNK_COOLDOWN_MS = 30000; // 30 seconds cooldown
-    private final Set<Integer> portalChunks = new HashSet<>(Arrays.asList(
+    private static final String OVERWORLD_NAME = "world";
+    private static final String END_WORLD_NAME = "world_the_end";
+    private static final int PORTAL_SIZE = 5;
+    private static final int PORTAL_OFFSET_IN_CHUNK = 7;
+    private static final int PORTAL_CENTER_OFFSET = PORTAL_SIZE / 2;
+    private static final int PORTAL_CLEARANCE_HEIGHT = 3;
+    private static final int GATEWAY_Y_OFFSET = 10;
+    private static final int GATEWAY_SHELL_OFFSET = 2;
+    private static final int END_PLATFORM_RADIUS = 2;
+    private static final int END_CLEARANCE_HEIGHT = 4;
+    private static final double MAX_TELEPORT_VELOCITY = 200.0D;
+    private static final long TELEPORT_COOLDOWN_MS = 1500L;
+    private static final byte GATEWAY_MARKER_VALUE = 1;
+    private static final TeleportFlag[] NO_TELEPORT_FLAGS = new TeleportFlag[0];
+
+    private final Set<Integer> portalChunks = Collections.unmodifiableSet(new HashSet<Integer>(Arrays.asList(
             156,     // Coordinates: 2500
             312,     // Coordinates: 5000
             625,     // Coordinates: 10000
@@ -46,272 +78,510 @@ public final class Loader extends JavaPlugin implements Listener {
             1812500, // Coordinates: 29000000
             1843750, // Coordinates: 29500000
             1874995  // Coordinates: 29999920
-    ));
+    )));
+    private final Map<UUID, Long> teleportCooldowns = new HashMap<UUID, Long>();
 
-    /**
-     * Called when the plugin is enabled.
-     */
+    private NamespacedKey gatewayMarkerKey;
+    private long nextCooldownCleanupAt;
+    private boolean warnedAboutMissingEndWorld;
+
     @Override
     public void onEnable() {
-        getServer().getPluginManager().registerEvents(this, this);  // Register event listeners
+        this.gatewayMarkerKey = new NamespacedKey(this, "managed_gateway");
 
-        // Schedule the repeating task to check entity locations and handle portal teleportation
-        getServer().getScheduler().scheduleSyncRepeatingTask(this, () -> {
-            Set<UUID> currentEntities = new HashSet<>();  // Set to track current entities
-            // Iterate through all worlds and their entities
-            Bukkit.getWorlds().forEach(world -> world.getEntities().forEach(entity -> {
-                if (!(entity.getPassengers().isEmpty()) || entity.isInsideVehicle()) return;
+        getServer().getPluginManager().registerEvents(this, this);
 
-                UUID entityId = entity.getUniqueId();
-                Location currentLocation = entity.getLocation();
-
-                currentEntities.add(entityId);
-
-                if (entityLocations.containsKey(entityId)) {
-                    Location prevLocation = entityLocations.get(entityId);
-                    if (prevLocation.equals(currentLocation)) return;
-
-                    handleGateway(entity);  // Teleport entity to the gateway
-                }
-                entityLocations.put(entityId, currentLocation);
-            }));
-            // Remove entities that are no longer present
-            entityLocations.keySet().removeIf(id -> !currentEntities.contains(id));
-        }, 0L, 1L); // 0 tick delay, 1 tick period (1 tick = 50ms)
+        if (Bukkit.getWorld(END_WORLD_NAME) == null) {
+            warnMissingEndWorld();
+        }
     }
 
-    /**
-     * Called when the plugin is disabled.
-     */
     @Override
     public void onDisable() {
+        teleportCooldowns.clear();
     }
 
-    /**
-     * Responds to the chunk load event, checks if the chunk should contain a custom portal,
-     * and if so, attempts to spawn it.
-     *
-     * @param event The chunk load event.
-     */
     @EventHandler(priority = EventPriority.LOW)
     public void onChunkLoad(ChunkLoadEvent event) {
-        String worldName = event.getWorld().getName();
+        if (!isManagedOverworld(event.getWorld())) {
+            return;
+        }
+
         Chunk chunk = event.getChunk();
-        if (!worldName.equalsIgnoreCase("world")) return;
-
-        long chunkKey = ((long) chunk.getX() << 32) | (chunk.getZ() & 0xFFFFFFFFL);
-        long currentTime = System.currentTimeMillis();
-        
-        // Check if the chunk was processed recently
-        if (chunkProcessingTimes.containsKey(chunkKey)) {
-            long lastProcessed = chunkProcessingTimes.get(chunkKey);
-            if (currentTime - lastProcessed < CHUNK_COOLDOWN_MS) {
-                return; // Skip if the chunk was processed too recently
-            }
-        }
-
-        if (portalChunks.contains(Math.abs(chunk.getX())) && portalChunks.contains(Math.abs(chunk.getZ()))) {
-            int startX = (chunk.getX() << 4);
-            int startZ = (chunk.getZ() << 4);
-
-            int groundY = chunk.getWorld().getHighestBlockYAt(startX + 8, startZ + 8);
-
-            spawnPortal(chunk, startX + 7, groundY, startZ + 7);
-            chunkProcessingTimes.put(chunkKey, currentTime);
-        }
-    }
-
-    /**
-     * Spawns a custom portal in the specified location if one does not already exist.
-     *
-     * @param chunk   The chunk where the portal is to be spawned.
-     * @param startX  The starting X coordinate for the portal.
-     * @param groundY The ground Y coordinate where the portal is to start.
-     * @param startZ  The starting Z coordinate for the portal.
-     */
-    private void spawnPortal(Chunk chunk, int startX, int groundY, int startZ) {
-        if (portalExists(chunk, startX, groundY, startZ)) {
+        if (!isPortalChunk(chunk.getX(), chunk.getZ())) {
             return;
         }
 
+        ensurePortal(chunk);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onEntityTeleportEndGateway(EntityTeleportEndGatewayEvent event) {
+        handleGatewayTeleport(event.getEntity(), event.getGateway().getBlock(), event);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPlayerTeleportEndGateway(PlayerTeleportEndGatewayEvent event) {
+        handleGatewayTeleport(event.getPlayer(), event.getGateway().getBlock(), event);
+    }
+
+    private void ensurePortal(Chunk chunk) {
         World world = chunk.getWorld();
+        int startX = getPortalStart(chunk.getX());
+        int startZ = getPortalStart(chunk.getZ());
 
-        for (int x = startX; x < startX + 5; x++) {
-            boolean isXBound = x == startX || x == startX + 4;
-            for (int z = startZ; z < startZ + 5; z++) {
-                boolean isZBound = z == startZ || z == startZ + 4;
+        List<Integer> existingGatewayBases = findGatewayBases(world, startX, startZ);
+        if (!existingGatewayBases.isEmpty()) {
+            int canonicalBaseY = existingGatewayBases.get(0);
 
-                boolean isFrame = isXBound || isZBound;
-                boolean isCorner = isXBound && isZBound;
+            for (int index = 1; index < existingGatewayBases.size(); index++) {
+                clearPortalStructure(world, startX, existingGatewayBases.get(index), startZ);
+            }
 
-                Material blockType = isCorner ? null : (isFrame ? Material.END_PORTAL_FRAME : Material.END_PORTAL);
+            if (!isPortalStructureComplete(world, startX, canonicalBaseY, startZ)) {
+                buildPortalStructure(world, startX, canonicalBaseY, startZ);
+            } else {
+                configureGatewayState(world.getBlockAt(startX + PORTAL_CENTER_OFFSET, canonicalBaseY + GATEWAY_Y_OFFSET, startZ + PORTAL_CENTER_OFFSET));
+            }
+            return;
+        }
 
-                for (int y = groundY; y <= groundY + 3; y++) {
-                    if (y > groundY && blockType == Material.END_PORTAL)
-                        continue;
+        Integer recoveredBaseY = findPortalBaseFromStructure(world, startX, startZ);
+        int baseY = recoveredBaseY != null ? recoveredBaseY.intValue() : resolvePortalBaseY(world, startX, startZ);
+        buildPortalStructure(world, startX, baseY, startZ);
+    }
 
-                    Block block = world.getBlockAt(x, y, z);
+    private List<Integer> findGatewayBases(World world, int startX, int startZ) {
+        int centerX = startX + PORTAL_CENTER_OFFSET;
+        int centerZ = startZ + PORTAL_CENTER_OFFSET;
+        List<Integer> baseHeights = new ArrayList<Integer>();
 
-                    if (y == groundY && blockType != null) {
-                        block.setType(blockType);
-                        if (blockType == Material.END_PORTAL_FRAME) {
-                            orientPortalFrame(block, x, startX, z, startZ);
-
-                            EndPortalFrame endPortalFrame = (EndPortalFrame) block.getBlockData();
-                            endPortalFrame.setEye(true);
-                            block.setBlockData(endPortalFrame);
-                        }
-                    } else {
-                        block.setType(Material.AIR);
-                    }
+        for (int y = world.getMinHeight(); y < world.getMaxHeight(); y++) {
+            if (world.getBlockAt(centerX, y, centerZ).getType() == Material.END_GATEWAY) {
+                int baseY = y - GATEWAY_Y_OFFSET;
+                if (isWithinBuildHeight(world, baseY)) {
+                    baseHeights.add(Integer.valueOf(baseY));
                 }
             }
         }
 
-        Block exitGatewayCenter = world.getBlockAt(startX + 2, groundY + 10, startZ + 2);
-        createExitGateway(exitGatewayCenter);
+        return baseHeights;
     }
 
-    /**
-     * Creates an exit gateway block with surrounding bedrock structure.
-     *
-     * @param centerBlock The center block location to create the gateway.
-     */
-    private void createExitGateway(Block centerBlock) {
-        centerBlock.setType(Material.END_GATEWAY);
+    private Integer findPortalBaseFromStructure(World world, int startX, int startZ) {
+        for (int y = world.getMinHeight(); y < world.getMaxHeight(); y++) {
+            if (hasPortalSignatureAt(world, startX, y, startZ)) {
+                return Integer.valueOf(y);
+            }
+        }
 
-        Block above = centerBlock.getRelative(BlockFace.UP);
-        Block below = centerBlock.getRelative(BlockFace.DOWN);
+        return null;
+    }
 
-        above.getRelative(BlockFace.UP).setType(Material.BEDROCK);
-        below.getRelative(BlockFace.DOWN).setType(Material.BEDROCK);
+    private boolean hasPortalSignatureAt(World world, int startX, int baseY, int startZ) {
+        int portalBlockCount = 0;
 
-        for (int i = -1; i <= 1; i++) {
-            if (i == 0) continue;
+        for (int x = startX; x < startX + PORTAL_SIZE; x++) {
+            for (int z = startZ; z < startZ + PORTAL_SIZE; z++) {
+                Material material = world.getBlockAt(x, baseY, z).getType();
+                if (material == Material.END_PORTAL || material == Material.END_PORTAL_FRAME) {
+                    portalBlockCount++;
+                }
+            }
+        }
 
-            above.getRelative(i, 0, 0).setType(Material.BEDROCK);
-            above.getRelative(0, 0, i).setType(Material.BEDROCK);
-            below.getRelative(i, 0, 0).setType(Material.BEDROCK);
-            below.getRelative(0, 0, i).setType(Material.BEDROCK);
+        return portalBlockCount >= 4;
+    }
+
+    private int resolvePortalBaseY(World world, int startX, int startZ) {
+        int centerX = startX + PORTAL_CENTER_OFFSET;
+        int centerZ = startZ + PORTAL_CENTER_OFFSET;
+        int highestY = world.getHighestBlockAt(centerX, centerZ, HeightMap.MOTION_BLOCKING_NO_LEAVES).getY();
+
+        for (int y = highestY; y >= world.getMinHeight(); y--) {
+            Material material = world.getBlockAt(centerX, y, centerZ).getType();
+            if (material == Material.AIR || isManagedStructureMaterial(material)) {
+                continue;
+            }
+
+            return clampBaseY(world, y);
+        }
+
+        return clampBaseY(world, highestY);
+    }
+
+    private int clampBaseY(World world, int baseY) {
+        int minBaseY = world.getMinHeight();
+        int maxBaseY = world.getMaxHeight() - GATEWAY_Y_OFFSET - GATEWAY_SHELL_OFFSET - 1;
+        return Math.max(minBaseY, Math.min(baseY, maxBaseY));
+    }
+
+    private boolean isPortalStructureComplete(World world, int startX, int baseY, int startZ) {
+        if (!isWithinBuildHeight(world, baseY) || !isWithinBuildHeight(world, baseY + GATEWAY_Y_OFFSET + GATEWAY_SHELL_OFFSET)) {
+            return false;
+        }
+
+        for (int x = startX; x < startX + PORTAL_SIZE; x++) {
+            boolean isXBoundary = x == startX || x == startX + PORTAL_SIZE - 1;
+            for (int z = startZ; z < startZ + PORTAL_SIZE; z++) {
+                boolean isZBoundary = z == startZ || z == startZ + PORTAL_SIZE - 1;
+                if (isXBoundary && isZBoundary) {
+                    continue;
+                }
+
+                Material expected = isXBoundary || isZBoundary ? Material.END_PORTAL_FRAME : Material.END_PORTAL;
+                if (world.getBlockAt(x, baseY, z).getType() != expected) {
+                    return false;
+                }
+            }
+        }
+
+        int centerX = startX + PORTAL_CENTER_OFFSET;
+        int centerZ = startZ + PORTAL_CENTER_OFFSET;
+        int gatewayY = baseY + GATEWAY_Y_OFFSET;
+        if (world.getBlockAt(centerX, gatewayY, centerZ).getType() != Material.END_GATEWAY) {
+            return false;
+        }
+
+        if (world.getBlockAt(centerX, gatewayY + GATEWAY_SHELL_OFFSET, centerZ).getType() != Material.BEDROCK) {
+            return false;
+        }
+
+        if (world.getBlockAt(centerX, gatewayY - GATEWAY_SHELL_OFFSET, centerZ).getType() != Material.BEDROCK) {
+            return false;
+        }
+
+        return isBedrock(world, centerX - 1, gatewayY + 1, centerZ)
+                && isBedrock(world, centerX + 1, gatewayY + 1, centerZ)
+                && isBedrock(world, centerX, gatewayY + 1, centerZ - 1)
+                && isBedrock(world, centerX, gatewayY + 1, centerZ + 1)
+                && isBedrock(world, centerX - 1, gatewayY - 1, centerZ)
+                && isBedrock(world, centerX + 1, gatewayY - 1, centerZ)
+                && isBedrock(world, centerX, gatewayY - 1, centerZ - 1)
+                && isBedrock(world, centerX, gatewayY - 1, centerZ + 1);
+    }
+
+    private boolean isBedrock(World world, int x, int y, int z) {
+        return isWithinBuildHeight(world, y) && world.getBlockAt(x, y, z).getType() == Material.BEDROCK;
+    }
+
+    private void buildPortalStructure(World world, int startX, int baseY, int startZ) {
+        int clampedBaseY = clampBaseY(world, baseY);
+
+        for (int x = startX; x < startX + PORTAL_SIZE; x++) {
+            boolean isXBoundary = x == startX || x == startX + PORTAL_SIZE - 1;
+            for (int z = startZ; z < startZ + PORTAL_SIZE; z++) {
+                boolean isZBoundary = z == startZ || z == startZ + PORTAL_SIZE - 1;
+                boolean isCorner = isXBoundary && isZBoundary;
+                boolean isFrame = isXBoundary || isZBoundary;
+
+                Block baseBlock = world.getBlockAt(x, clampedBaseY, z);
+                if (isCorner) {
+                    setBlock(baseBlock, Material.AIR);
+                } else if (isFrame) {
+                    setBlock(baseBlock, Material.END_PORTAL_FRAME);
+                    orientPortalFrame(baseBlock, x, startX, z, startZ);
+                } else {
+                    setBlock(baseBlock, Material.END_PORTAL);
+                }
+
+                for (int y = 1; y <= PORTAL_CLEARANCE_HEIGHT; y++) {
+                    clearToAir(world.getBlockAt(x, clampedBaseY + y, z));
+                }
+            }
+        }
+
+        createGatewayStructure(world, startX + PORTAL_CENTER_OFFSET, clampedBaseY + GATEWAY_Y_OFFSET, startZ + PORTAL_CENTER_OFFSET);
+    }
+
+    private void createGatewayStructure(World world, int centerX, int centerY, int centerZ) {
+        clearToAir(world.getBlockAt(centerX, centerY - 1, centerZ));
+        clearToAir(world.getBlockAt(centerX, centerY + 1, centerZ));
+
+        Block gatewayBlock = world.getBlockAt(centerX, centerY, centerZ);
+        setBlock(gatewayBlock, Material.END_GATEWAY);
+        configureGatewayState(gatewayBlock);
+
+        setBlock(world.getBlockAt(centerX, centerY + GATEWAY_SHELL_OFFSET, centerZ), Material.BEDROCK);
+        setBlock(world.getBlockAt(centerX, centerY - GATEWAY_SHELL_OFFSET, centerZ), Material.BEDROCK);
+
+        for (int offset = -1; offset <= 1; offset += 2) {
+            setBlock(world.getBlockAt(centerX + offset, centerY + 1, centerZ), Material.BEDROCK);
+            setBlock(world.getBlockAt(centerX, centerY + 1, centerZ + offset), Material.BEDROCK);
+            setBlock(world.getBlockAt(centerX + offset, centerY - 1, centerZ), Material.BEDROCK);
+            setBlock(world.getBlockAt(centerX, centerY - 1, centerZ + offset), Material.BEDROCK);
         }
     }
 
-    /**
-     * Orientates the portal frame based on its position relative to the portal structure.
-     *
-     * @param block  The block to orient.
-     * @param x      The x coordinate of the block to orient.
-     * @param startX The starting x coordinate of the portal.
-     * @param z      The z coordinate of the block to orient.
-     * @param startZ The starting z coordinate of the portal.
-     */
+    private void configureGatewayState(Block gatewayBlock) {
+        BlockState state = gatewayBlock.getState();
+        if (!(state instanceof EndGateway)) {
+            return;
+        }
+
+        EndGateway gateway = (EndGateway) state;
+        World endWorld = Bukkit.getWorld(END_WORLD_NAME);
+        if (endWorld != null) {
+            gateway.setExitLocation(new Location(
+                    endWorld,
+                    gatewayBlock.getX() + 0.5D,
+                    gatewayBlock.getY(),
+                    gatewayBlock.getZ() + 0.5D
+            ));
+            gateway.setExactTeleport(true);
+        }
+
+        gateway.getPersistentDataContainer().set(gatewayMarkerKey, PersistentDataType.BYTE, Byte.valueOf(GATEWAY_MARKER_VALUE));
+        gateway.update(true, false);
+    }
+
+    private void clearPortalStructure(World world, int startX, int baseY, int startZ) {
+        for (int x = startX; x < startX + PORTAL_SIZE; x++) {
+            for (int z = startZ; z < startZ + PORTAL_SIZE; z++) {
+                for (int y = 0; y <= PORTAL_CLEARANCE_HEIGHT; y++) {
+                    clearManagedStructure(world.getBlockAt(x, baseY + y, z));
+                }
+            }
+        }
+
+        int centerX = startX + PORTAL_CENTER_OFFSET;
+        int centerZ = startZ + PORTAL_CENTER_OFFSET;
+        int gatewayY = baseY + GATEWAY_Y_OFFSET;
+
+        clearManagedStructure(world.getBlockAt(centerX, gatewayY, centerZ));
+        clearManagedStructure(world.getBlockAt(centerX, gatewayY + 1, centerZ));
+        clearManagedStructure(world.getBlockAt(centerX, gatewayY - 1, centerZ));
+        clearManagedStructure(world.getBlockAt(centerX, gatewayY + GATEWAY_SHELL_OFFSET, centerZ));
+        clearManagedStructure(world.getBlockAt(centerX, gatewayY - GATEWAY_SHELL_OFFSET, centerZ));
+
+        for (int offset = -1; offset <= 1; offset += 2) {
+            clearManagedStructure(world.getBlockAt(centerX + offset, gatewayY + 1, centerZ));
+            clearManagedStructure(world.getBlockAt(centerX, gatewayY + 1, centerZ + offset));
+            clearManagedStructure(world.getBlockAt(centerX + offset, gatewayY - 1, centerZ));
+            clearManagedStructure(world.getBlockAt(centerX, gatewayY - 1, centerZ + offset));
+        }
+    }
+
+    private void clearManagedStructure(Block block) {
+        if (isManagedStructureMaterial(block.getType())) {
+            clearToAir(block);
+        }
+    }
+
+    private boolean isManagedStructureMaterial(Material material) {
+        return material == Material.END_PORTAL
+                || material == Material.END_PORTAL_FRAME
+                || material == Material.END_GATEWAY
+                || material == Material.BEDROCK;
+    }
+
     private void orientPortalFrame(Block block, int x, int startX, int z, int startZ) {
-        if (block.getType() != Material.END_PORTAL_FRAME) return;
-
         Directional directional = (Directional) block.getBlockData();
-        if (x == startX) directional.setFacing(BlockFace.EAST);
-        else if (x == startX + 4) directional.setFacing(BlockFace.WEST);
-        else if (z == startZ) directional.setFacing(BlockFace.SOUTH);
-        else if (z == startZ + 4) directional.setFacing(BlockFace.NORTH);
-
-        block.setBlockData(directional);
-    }
-
-    /**
-     * Checks if a portal already exists within a certain vicinity of the specified location.
-     *
-     * @param chunk   The chunk to check within.
-     * @param startX  The starting x coordinate to check from.
-     * @param groundY The ground y coordinate to check from.
-     * @param startZ  The starting z coordinate to check from.
-     * @return true if a portal exists, false otherwise.
-     */
-    private boolean portalExists(Chunk chunk, int startX, int groundY, int startZ) {
-        World world = chunk.getWorld();
-
-        int maxX = startX + 5;
-        int maxZ = startZ + 5;
-        int maxHeightCheck = groundY + 11;
-
-        for (int x = startX - 5; x <= maxX; x++) {
-            for (int y = groundY - 1; y <= maxHeightCheck; y++) {
-                for (int z = startZ - 5; z <= maxZ; z++) {
-                    Material blockType = world.getBlockAt(x, y, z).getType();
-
-                    if (blockType == Material.END_PORTAL_FRAME || blockType == Material.END_PORTAL) {
-                        return true;
-                    }
-
-                    if (blockType == Material.END_GATEWAY) {
-                        return true;
-                    }
-                }
-            }
+        if (x == startX) {
+            directional.setFacing(BlockFace.EAST);
+        } else if (x == startX + PORTAL_SIZE - 1) {
+            directional.setFacing(BlockFace.WEST);
+        } else if (z == startZ) {
+            directional.setFacing(BlockFace.SOUTH);
+        } else if (z == startZ + PORTAL_SIZE - 1) {
+            directional.setFacing(BlockFace.NORTH);
         }
 
-        return false;
+        EndPortalFrame endPortalFrame = (EndPortalFrame) directional;
+        endPortalFrame.setEye(true);
+        block.setBlockData(endPortalFrame, false);
     }
 
-    /**
-     * Teleports an entity to the corresponding location in the End world
-     * if the entity is within a custom end gateway in a designated portal chunk.
-     * Generates a 5x5 obsidian platform under the entity and naturally breaks blocks 3 blocks above the platform.
-     * Retains the entity's velocity with a limit of 200 m/s.
-     *
-     * @param entity The entity to potentially teleport.
-     */
-    private void handleGateway(Entity entity) {
-        Location entityLocation = entity.getLocation();
-        int chunkX = entityLocation.getBlockX() >> 4;
-        int chunkZ = entityLocation.getBlockZ() >> 4;
-
-        // Check if the entity is in a relevant chunk
-        if (!portalChunks.contains(Math.abs(chunkX)) || !portalChunks.contains(Math.abs(chunkZ))) {
+    private void handleGatewayTeleport(Entity entity, Block gatewayBlock, Cancellable event) {
+        if (!isManagedGateway(gatewayBlock)) {
             return;
         }
 
-        Block block = entityLocation.getBlock();
-        if (block.getType() == Material.END_GATEWAY) {
-            Location endGatewayLocation = new Location(
-                    Bukkit.getWorld("world_the_end"),
-                    block.getX(),
-                    block.getY(),
-                    block.getZ()
-            );
-
-            // Generate 5x5 obsidian platform centered on the entity's location
-            for (int x = -2; x <= 2; x++) {
-                for (int z = -2; z <= 2; z++) {
-                    Location platformBlockLocation = endGatewayLocation.clone().add(x, -1, z);
-                    platformBlockLocation.getBlock().setType(Material.OBSIDIAN);
-                }
-            }
-
-            // Naturally break blocks 3 blocks above the obsidian platform
-            for (int x = -2; x <= 2; x++) {
-                for (int z = -2; z <= 2; z++) {
-                    for (int y = 0; y <= 3; y++) {
-                        Location clearBlockLocation = endGatewayLocation.clone().add(x, y, z);
-                        Block blockToClear = clearBlockLocation.getBlock();
-                        if (blockToClear.getType() != Material.AIR) {
-                            blockToClear.breakNaturally();
-                        }
-                    }
-                }
-            }
-
-            // Get and cap the entity's velocity
-            Vector velocity = entity.getVelocity();
-            double maxVelocity = 200.0; // Max velocity in m/s
-            if (velocity.length() > maxVelocity) {
-                velocity = velocity.normalize().multiply(maxVelocity);
-            }
-
-            // Teleport the entity to the specified location
-            entity.teleport(endGatewayLocation);
-
-            // Set the entity's velocity to the capped velocity
-            entity.setVelocity(velocity);
+        if (entity.isInsideVehicle()) {
+            event.setCancelled(true);
+            return;
         }
+
+        if (!beginTeleportCooldown(entity.getUniqueId())) {
+            event.setCancelled(true);
+            return;
+        }
+
+        World endWorld = Bukkit.getWorld(END_WORLD_NAME);
+        if (endWorld == null) {
+            event.setCancelled(true);
+            warnMissingEndWorld();
+            return;
+        }
+
+        Vector velocity = capVelocity(entity.getVelocity());
+        Location origin = entity.getLocation();
+        Location destination = new Location(
+                endWorld,
+                gatewayBlock.getX() + 0.5D,
+                gatewayBlock.getY(),
+                gatewayBlock.getZ() + 0.5D,
+                origin.getYaw(),
+                origin.getPitch()
+        );
+
+        prepareEndArrival(destination);
+        event.setCancelled(true);
+
+        boolean teleported = entity.teleport(destination, PlayerTeleportEvent.TeleportCause.END_GATEWAY, getTeleportFlags(entity));
+        if (!teleported && !entity.getPassengers().isEmpty()) {
+            teleported = entity.teleport(destination, PlayerTeleportEvent.TeleportCause.END_GATEWAY);
+        }
+
+        if (!teleported) {
+            teleportCooldowns.remove(entity.getUniqueId());
+            return;
+        }
+
+        if (velocity.lengthSquared() == 0.0D) {
+            return;
+        }
+
+        final Vector preservedVelocity = velocity;
+        Bukkit.getScheduler().runTask(this, new Runnable() {
+            @Override
+            public void run() {
+                if (entity.isValid()) {
+                    entity.setVelocity(preservedVelocity);
+                }
+            }
+        });
+    }
+
+    private boolean isManagedGateway(Block block) {
+        if (block.getType() != Material.END_GATEWAY || !isManagedOverworld(block.getWorld())) {
+            return false;
+        }
+
+        Chunk chunk = block.getChunk();
+        if (!isPortalChunk(chunk.getX(), chunk.getZ())) {
+            return false;
+        }
+
+        int expectedCenterX = getPortalStart(chunk.getX()) + PORTAL_CENTER_OFFSET;
+        int expectedCenterZ = getPortalStart(chunk.getZ()) + PORTAL_CENTER_OFFSET;
+        if (block.getX() != expectedCenterX || block.getZ() != expectedCenterZ) {
+            return false;
+        }
+
+        BlockState state = block.getState();
+        if (state instanceof EndGateway) {
+            Byte marker = ((EndGateway) state).getPersistentDataContainer().get(gatewayMarkerKey, PersistentDataType.BYTE);
+            return marker == null || marker.byteValue() == GATEWAY_MARKER_VALUE;
+        }
+
+        return true;
+    }
+
+    private boolean beginTeleportCooldown(UUID entityId) {
+        long now = System.currentTimeMillis();
+        if (now >= nextCooldownCleanupAt) {
+            cleanupExpiredCooldowns(now);
+            nextCooldownCleanupAt = now + TELEPORT_COOLDOWN_MS;
+        }
+
+        Long expiresAt = teleportCooldowns.get(entityId);
+        if (expiresAt != null && expiresAt.longValue() > now) {
+            return false;
+        }
+
+        teleportCooldowns.put(entityId, Long.valueOf(now + TELEPORT_COOLDOWN_MS));
+        return true;
+    }
+
+    private void cleanupExpiredCooldowns(long now) {
+        List<UUID> expiredEntries = new ArrayList<UUID>();
+        for (Map.Entry<UUID, Long> entry : teleportCooldowns.entrySet()) {
+            if (entry.getValue().longValue() <= now) {
+                expiredEntries.add(entry.getKey());
+            }
+        }
+
+        for (UUID entityId : expiredEntries) {
+            teleportCooldowns.remove(entityId);
+        }
+    }
+
+    private TeleportFlag[] getTeleportFlags(Entity entity) {
+        if (entity.getPassengers().isEmpty()) {
+            return NO_TELEPORT_FLAGS;
+        }
+
+        return new TeleportFlag[]{TeleportFlag.EntityState.RETAIN_PASSENGERS};
+    }
+
+    private Vector capVelocity(Vector velocity) {
+        Vector safeVelocity = velocity.clone();
+        double maxVelocitySquared = MAX_TELEPORT_VELOCITY * MAX_TELEPORT_VELOCITY;
+
+        if (safeVelocity.lengthSquared() > maxVelocitySquared) {
+            safeVelocity.normalize().multiply(MAX_TELEPORT_VELOCITY);
+        }
+
+        return safeVelocity;
+    }
+
+    private void prepareEndArrival(Location destination) {
+        World world = destination.getWorld();
+        if (world == null) {
+            return;
+        }
+
+        int baseX = destination.getBlockX();
+        int baseY = destination.getBlockY();
+        int baseZ = destination.getBlockZ();
+
+        for (int x = -END_PLATFORM_RADIUS; x <= END_PLATFORM_RADIUS; x++) {
+            for (int z = -END_PLATFORM_RADIUS; z <= END_PLATFORM_RADIUS; z++) {
+                setBlock(world.getBlockAt(baseX + x, baseY - 1, baseZ + z), Material.OBSIDIAN);
+
+                for (int y = 0; y < END_CLEARANCE_HEIGHT; y++) {
+                    clearToAir(world.getBlockAt(baseX + x, baseY + y, baseZ + z));
+                }
+            }
+        }
+    }
+
+    private void setBlock(Block block, Material material) {
+        if (block.getType() != material) {
+            block.setType(material, false);
+        }
+    }
+
+    private void clearToAir(Block block) {
+        if (block.getType() != Material.AIR) {
+            block.setType(Material.AIR, false);
+        }
+    }
+
+    private boolean isManagedOverworld(World world) {
+        return world.getName().equalsIgnoreCase(OVERWORLD_NAME);
+    }
+
+    private boolean isPortalChunk(int chunkX, int chunkZ) {
+        return portalChunks.contains(Integer.valueOf(Math.abs(chunkX)))
+                && portalChunks.contains(Integer.valueOf(Math.abs(chunkZ)));
+    }
+
+    private int getPortalStart(int chunkCoordinate) {
+        return (chunkCoordinate << 4) + PORTAL_OFFSET_IN_CHUNK;
+    }
+
+    private boolean isWithinBuildHeight(World world, int y) {
+        return y >= world.getMinHeight() && y < world.getMaxHeight();
+    }
+
+    private void warnMissingEndWorld() {
+        if (warnedAboutMissingEndWorld) {
+            return;
+        }
+
+        warnedAboutMissingEndWorld = true;
+        getLogger().warning("End world '" + END_WORLD_NAME + "' is not loaded. Extended gateway teleports will stay disabled until that world is available.");
     }
 }
