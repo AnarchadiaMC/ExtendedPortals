@@ -1,8 +1,5 @@
 package org.anarchadia.extendedportals;
 
-import com.destroystokyo.paper.event.entity.EntityTeleportEndGatewayEvent;
-import com.destroystokyo.paper.event.player.PlayerTeleportEndGatewayEvent;
-import io.papermc.paper.entity.TeleportFlag;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.HeightMap;
@@ -17,12 +14,12 @@ import org.bukkit.block.EndGateway;
 import org.bukkit.block.data.Directional;
 import org.bukkit.block.data.type.EndPortalFrame;
 import org.bukkit.entity.Entity;
-import org.bukkit.event.Cancellable;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
+import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
@@ -55,7 +52,6 @@ public final class Loader extends JavaPlugin implements Listener {
     private static final double MAX_TELEPORT_VELOCITY = 200.0D;
     private static final long TELEPORT_COOLDOWN_MS = 1500L;
     private static final byte GATEWAY_MARKER_VALUE = 1;
-    private static final TeleportFlag[] NO_TELEPORT_FLAGS = new TeleportFlag[0];
 
     private final Set<Integer> portalChunks = Collections.unmodifiableSet(new HashSet<Integer>(Arrays.asList(
             156,     // Coordinates: 2500
@@ -79,6 +75,7 @@ public final class Loader extends JavaPlugin implements Listener {
             1843750, // Coordinates: 29500000
             1874995  // Coordinates: 29999920
     )));
+    private final Map<Long, Location> loadedPortalGateways = new HashMap<Long, Location>();
     private final Map<UUID, Long> teleportCooldowns = new HashMap<UUID, Long>();
 
     private NamespacedKey gatewayMarkerKey;
@@ -90,6 +87,13 @@ public final class Loader extends JavaPlugin implements Listener {
         this.gatewayMarkerKey = new NamespacedKey(this, "managed_gateway");
 
         getServer().getPluginManager().registerEvents(this, this);
+        trackLoadedPortalChunks();
+        getServer().getScheduler().runTaskTimer(this, new Runnable() {
+            @Override
+            public void run() {
+                pollLoadedPortalGateways();
+            }
+        }, 1L, 1L);
 
         if (Bukkit.getWorld(END_WORLD_NAME) == null) {
             warnMissingEndWorld();
@@ -98,6 +102,7 @@ public final class Loader extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
+        loadedPortalGateways.clear();
         teleportCooldowns.clear();
     }
 
@@ -112,20 +117,31 @@ public final class Loader extends JavaPlugin implements Listener {
             return;
         }
 
-        ensurePortal(chunk);
+        loadedPortalGateways.put(Long.valueOf(chunkKey(chunk.getX(), chunk.getZ())), ensurePortal(chunk));
     }
 
-    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
-    public void onEntityTeleportEndGateway(EntityTeleportEndGatewayEvent event) {
-        handleGatewayTeleport(event.getEntity(), event.getGateway().getBlock(), event);
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onChunkUnload(ChunkUnloadEvent event) {
+        loadedPortalGateways.remove(Long.valueOf(chunkKey(event.getChunk().getX(), event.getChunk().getZ())));
     }
 
-    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
-    public void onPlayerTeleportEndGateway(PlayerTeleportEndGatewayEvent event) {
-        handleGatewayTeleport(event.getPlayer(), event.getGateway().getBlock(), event);
+    private void trackLoadedPortalChunks() {
+        for (World world : Bukkit.getWorlds()) {
+            if (!isManagedOverworld(world)) {
+                continue;
+            }
+
+            for (Chunk chunk : world.getLoadedChunks()) {
+                if (!isPortalChunk(chunk.getX(), chunk.getZ())) {
+                    continue;
+                }
+
+                loadedPortalGateways.put(Long.valueOf(chunkKey(chunk.getX(), chunk.getZ())), ensurePortal(chunk));
+            }
+        }
     }
 
-    private void ensurePortal(Chunk chunk) {
+    private Location ensurePortal(Chunk chunk) {
         World world = chunk.getWorld();
         int startX = getPortalStart(chunk.getX());
         int startZ = getPortalStart(chunk.getZ());
@@ -141,14 +157,16 @@ public final class Loader extends JavaPlugin implements Listener {
             if (!isPortalStructureComplete(world, startX, canonicalBaseY, startZ)) {
                 buildPortalStructure(world, startX, canonicalBaseY, startZ);
             } else {
-                configureGatewayState(world.getBlockAt(startX + PORTAL_CENTER_OFFSET, canonicalBaseY + GATEWAY_Y_OFFSET, startZ + PORTAL_CENTER_OFFSET));
+                createGatewayStructure(world, startX + PORTAL_CENTER_OFFSET, canonicalBaseY + GATEWAY_Y_OFFSET, startZ + PORTAL_CENTER_OFFSET);
             }
-            return;
+
+            return createGatewayLocation(world, startX, canonicalBaseY, startZ);
         }
 
         Integer recoveredBaseY = findPortalBaseFromStructure(world, startX, startZ);
         int baseY = recoveredBaseY != null ? recoveredBaseY.intValue() : resolvePortalBaseY(world, startX, startZ);
         buildPortalStructure(world, startX, baseY, startZ);
+        return createGatewayLocation(world, startX, baseY, startZ);
     }
 
     private List<Integer> findGatewayBases(World world, int startX, int startZ) {
@@ -298,10 +316,6 @@ public final class Loader extends JavaPlugin implements Listener {
         clearToAir(world.getBlockAt(centerX, centerY - 1, centerZ));
         clearToAir(world.getBlockAt(centerX, centerY + 1, centerZ));
 
-        Block gatewayBlock = world.getBlockAt(centerX, centerY, centerZ);
-        setBlock(gatewayBlock, Material.END_GATEWAY);
-        configureGatewayState(gatewayBlock);
-
         setBlock(world.getBlockAt(centerX, centerY + GATEWAY_SHELL_OFFSET, centerZ), Material.BEDROCK);
         setBlock(world.getBlockAt(centerX, centerY - GATEWAY_SHELL_OFFSET, centerZ), Material.BEDROCK);
 
@@ -311,6 +325,10 @@ public final class Loader extends JavaPlugin implements Listener {
             setBlock(world.getBlockAt(centerX + offset, centerY - 1, centerZ), Material.BEDROCK);
             setBlock(world.getBlockAt(centerX, centerY - 1, centerZ + offset), Material.BEDROCK);
         }
+
+        Block gatewayBlock = world.getBlockAt(centerX, centerY, centerZ);
+        setBlock(gatewayBlock, Material.END_GATEWAY);
+        configureGatewayState(gatewayBlock);
     }
 
     private void configureGatewayState(Block gatewayBlock) {
@@ -392,67 +410,6 @@ public final class Loader extends JavaPlugin implements Listener {
         block.setBlockData(endPortalFrame, false);
     }
 
-    private void handleGatewayTeleport(Entity entity, Block gatewayBlock, Cancellable event) {
-        if (!isManagedGateway(gatewayBlock)) {
-            return;
-        }
-
-        if (entity.isInsideVehicle()) {
-            event.setCancelled(true);
-            return;
-        }
-
-        if (!beginTeleportCooldown(entity.getUniqueId())) {
-            event.setCancelled(true);
-            return;
-        }
-
-        World endWorld = Bukkit.getWorld(END_WORLD_NAME);
-        if (endWorld == null) {
-            event.setCancelled(true);
-            warnMissingEndWorld();
-            return;
-        }
-
-        Vector velocity = capVelocity(entity.getVelocity());
-        Location origin = entity.getLocation();
-        Location destination = new Location(
-                endWorld,
-                gatewayBlock.getX() + 0.5D,
-                gatewayBlock.getY(),
-                gatewayBlock.getZ() + 0.5D,
-                origin.getYaw(),
-                origin.getPitch()
-        );
-
-        prepareEndArrival(destination);
-        event.setCancelled(true);
-
-        boolean teleported = entity.teleport(destination, PlayerTeleportEvent.TeleportCause.END_GATEWAY, getTeleportFlags(entity));
-        if (!teleported && !entity.getPassengers().isEmpty()) {
-            teleported = entity.teleport(destination, PlayerTeleportEvent.TeleportCause.END_GATEWAY);
-        }
-
-        if (!teleported) {
-            teleportCooldowns.remove(entity.getUniqueId());
-            return;
-        }
-
-        if (velocity.lengthSquared() == 0.0D) {
-            return;
-        }
-
-        final Vector preservedVelocity = velocity;
-        Bukkit.getScheduler().runTask(this, new Runnable() {
-            @Override
-            public void run() {
-                if (entity.isValid()) {
-                    entity.setVelocity(preservedVelocity);
-                }
-            }
-        });
-    }
-
     private boolean isManagedGateway(Block block) {
         if (block.getType() != Material.END_GATEWAY || !isManagedOverworld(block.getWorld())) {
             return false;
@@ -476,6 +433,98 @@ public final class Loader extends JavaPlugin implements Listener {
         }
 
         return true;
+    }
+
+    private void pollLoadedPortalGateways() {
+        if (loadedPortalGateways.isEmpty()) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (now >= nextCooldownCleanupAt) {
+            cleanupExpiredCooldowns(now);
+            nextCooldownCleanupAt = now + TELEPORT_COOLDOWN_MS;
+        }
+
+        for (Location gatewayLocation : loadedPortalGateways.values()) {
+            World world = gatewayLocation.getWorld();
+            if (world == null || !world.isChunkLoaded(gatewayLocation.getBlockX() >> 4, gatewayLocation.getBlockZ() >> 4)) {
+                continue;
+            }
+
+            Block gatewayBlock = world.getBlockAt(gatewayLocation);
+            if (!isManagedGateway(gatewayBlock)) {
+                continue;
+            }
+
+            for (Entity entity : gatewayBlock.getChunk().getEntities()) {
+                if (!shouldTeleportEntity(entity, gatewayBlock)) {
+                    continue;
+                }
+
+                teleportEntityThroughGateway(entity, gatewayBlock);
+            }
+        }
+    }
+
+    private boolean shouldTeleportEntity(Entity entity, Block gatewayBlock) {
+        if (!entity.isValid() || entity.isDead()) {
+            return false;
+        }
+
+        if (entity.isInsideVehicle() || !entity.getPassengers().isEmpty()) {
+            return false;
+        }
+
+        Location entityLocation = entity.getLocation();
+        return entityLocation.getBlockX() == gatewayBlock.getX()
+                && entityLocation.getBlockY() == gatewayBlock.getY()
+                && entityLocation.getBlockZ() == gatewayBlock.getZ();
+    }
+
+    private void teleportEntityThroughGateway(Entity entity, Block gatewayBlock) {
+        if (!beginTeleportCooldown(entity.getUniqueId())) {
+            return;
+        }
+
+        World endWorld = Bukkit.getWorld(END_WORLD_NAME);
+        if (endWorld == null) {
+            teleportCooldowns.remove(entity.getUniqueId());
+            warnMissingEndWorld();
+            return;
+        }
+
+        Vector velocity = capVelocity(entity.getVelocity());
+        Location origin = entity.getLocation();
+        Location destination = new Location(
+                endWorld,
+                gatewayBlock.getX() + 0.5D,
+                gatewayBlock.getY(),
+                gatewayBlock.getZ() + 0.5D,
+                origin.getYaw(),
+                origin.getPitch()
+        );
+
+        prepareEndArrival(destination);
+
+        if (!entity.teleport(destination, PlayerTeleportEvent.TeleportCause.END_GATEWAY)) {
+            teleportCooldowns.remove(entity.getUniqueId());
+            return;
+        }
+
+        if (velocity.lengthSquared() == 0.0D) {
+            return;
+        }
+
+        final Vector preservedVelocity = velocity;
+        Bukkit.getScheduler().runTask(this, new Runnable() {
+            @Override
+            public void run() {
+                if (entity.isValid()) {
+                    entity.setVelocity(preservedVelocity);
+                }
+            }
+        });
     }
 
     private boolean beginTeleportCooldown(UUID entityId) {
@@ -505,14 +554,6 @@ public final class Loader extends JavaPlugin implements Listener {
         for (UUID entityId : expiredEntries) {
             teleportCooldowns.remove(entityId);
         }
-    }
-
-    private TeleportFlag[] getTeleportFlags(Entity entity) {
-        if (entity.getPassengers().isEmpty()) {
-            return NO_TELEPORT_FLAGS;
-        }
-
-        return new TeleportFlag[]{TeleportFlag.EntityState.RETAIN_PASSENGERS};
     }
 
     private Vector capVelocity(Vector velocity) {
@@ -570,6 +611,19 @@ public final class Loader extends JavaPlugin implements Listener {
 
     private int getPortalStart(int chunkCoordinate) {
         return (chunkCoordinate << 4) + PORTAL_OFFSET_IN_CHUNK;
+    }
+
+    private Location createGatewayLocation(World world, int startX, int baseY, int startZ) {
+        return new Location(
+                world,
+                startX + PORTAL_CENTER_OFFSET,
+                baseY + GATEWAY_Y_OFFSET,
+                startZ + PORTAL_CENTER_OFFSET
+        );
+    }
+
+    private long chunkKey(int chunkX, int chunkZ) {
+        return ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
     }
 
     private boolean isWithinBuildHeight(World world, int y) {
